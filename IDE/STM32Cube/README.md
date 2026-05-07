@@ -45,7 +45,7 @@ Add this code to your CubeMX-generated main.c in the corresponding USER CODE sec
 **In USER CODE BEGIN Includes:**
 ```c
 #include "wolfip.h"
-#include "stm32_hal_eth.h"
+#include "stm32_eth.h"
 ```
 
 **In USER CODE BEGIN PV:**
@@ -56,7 +56,7 @@ static struct wolfIP *ipstack = NULL;
 **In USER CODE BEGIN 2 (after MX_ETH_Init):**
 ```c
 wolfIP_init_static(&ipstack);
-if (stm32_hal_eth_init(wolfIP_getdev(ipstack)) != 0) {
+if (stm32_eth_init(wolfIP_getdev(ipstack), NULL) < 0) {
     Error_Handler();
 }
 wolfIP_ipconfig_set(ipstack,
@@ -96,9 +96,9 @@ uint32_t wolfIP_getrandom(void)
 1. **Check NVIC**: ETH global interrupt must be ENABLED in CubeMX
 2. **Check cable**: Ensure Ethernet cable is connected and link LED is on
 3. **Check IP**: Ensure IP address is on same subnet as your PC
-4. **Check return value**: Verify `stm32_hal_eth_init()` returns 0
+4. **Check return value**: Verify `stm32_eth_init()` returns 0
 
-### stm32_hal_eth_init() returns -3
+### stm32_eth_init() returns -3
 
 This means the ETH reinitialization failed. Check:
 - ETH peripheral is properly configured in CubeMX
