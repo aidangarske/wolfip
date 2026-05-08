@@ -231,6 +231,9 @@ static void eth_config_mac(const uint8_t mac[6])
                   ((uint32_t)mac[2] << 16) |
                   ((uint32_t)mac[1] << 8) |
                    (uint32_t)mac[0];
+
+    /* Promiscuous mode - accept all frames regardless of destination. */
+    ETH_MACPFR = 1U;
 }
 
 static void eth_config_speed_duplex(void)
@@ -291,32 +294,27 @@ static void eth_init_desc(void)
     rx_idx = 0;
     tx_idx = 0;
 
-    /* Step 2: Configure DMA registers. */
-    __asm volatile ("dsb sy" ::: "memory");
-    ETH_DMACTXDLAR = (uint32_t)&tx_ring[0];
-    ETH_DMACRXDLAR = (uint32_t)&rx_ring[0];
-    ETH_DMACTXRLR = TX_DESC_COUNT - 1U;
-    ETH_DMACRXRLR = RX_DESC_COUNT - 1U;
-    ETH_DMACTXDTPR = (uint32_t)&tx_ring[0];
-    ETH_DMACRXDTPR = (uint32_t)&rx_ring[RX_DESC_COUNT - 1U];
-    __asm volatile ("dsb sy" ::: "memory");
-
-    /* Step 3: Now set buffer addresses and OWN bit. */
+    /* Set buffer addresses and OWN bits BEFORE programming DLAR/RLR.
+     * Matches wolfHAL ordering — DMA uses DLAR latched-at-write to fetch
+     * descriptor contents. If DLAR is set before OWN=1, DMA may see all
+     * descriptors as CPU-owned and never transition out of stopped. */
     for (i = 0; i < TX_DESC_COUNT; i++) {
         *(volatile uint32_t *)&tx_ring[i].des0 = (uint32_t)tx_buffers[i];
     }
     for (i = 0; i < RX_DESC_COUNT; i++) {
         *(volatile uint32_t *)&rx_ring[i].des0 = (uint32_t)rx_buffers[i];
-        *(volatile uint32_t *)&rx_ring[i].des3 = ETH_RDES3_OWN | ETH_RDES3_IOC | ETH_RDES3_BUF1V;
+        *(volatile uint32_t *)&rx_ring[i].des3 =
+            ETH_RDES3_OWN | ETH_RDES3_IOC | ETH_RDES3_BUF1V;
     }
+    __asm volatile ("dsb sy" ::: "memory");
 
-    /* Data synchronization barrier before updating tail pointer. */
+    /* Now program descriptor list addresses and ring lengths. */
+    ETH_DMACTXDLAR = (uint32_t)&tx_ring[0];
+    ETH_DMACRXDLAR = (uint32_t)&rx_ring[0];
+    ETH_DMACTXRLR = TX_DESC_COUNT - 1U;
+    ETH_DMACRXRLR = RX_DESC_COUNT - 1U;
     __asm volatile ("dsb sy" ::: "memory");
-    __asm volatile ("isb sy" ::: "memory");
-    /* Step 4: Update tail pointer to signal DMA that descriptors are ready. */
-    ETH_DMACRXDTPR = (uint32_t)&rx_ring[RX_DESC_COUNT - 1U];
-    /* Final barrier. */
-    __asm volatile ("dsb sy" ::: "memory");
+    /* DMACRDTPR is written last in eth_start(). */
 }
 
 #define ETH_DMACCR_DSL_0BIT  (0x00000000u)
@@ -328,7 +326,7 @@ static void eth_config_dma(void)
     ETH_DMACCR = ETH_DMACCR_DSL_0BIT;
     ETH_DMACRXCR = ((RX_BUF_SIZE & ETH_RDES3_PL_MASK) << ETH_DMACRXCR_RBSZ_SHIFT) |
                    ETH_DMACRXCR_RPBL(DMA_RPBL);
-    ETH_DMACTXCR = ETH_DMACTXCR_OSF | ETH_DMACTXCR_TPBL(DMA_TPBL);
+    ETH_DMACTXCR = ETH_DMACTXCR_TPBL(DMA_TPBL);
 }
 
 #define ETH_DMACSR_TPS  (1U << 1)
@@ -337,16 +335,10 @@ static void eth_config_dma(void)
 static void eth_start(void)
 {
     ETH_MACCR |= ETH_MACCR_TE | ETH_MACCR_RE;
-    ETH_MTLTXQOMR |= ETH_MTLTXQOMR_FTQ;
     ETH_DMACTXCR |= ETH_DMACTXCR_ST;
     ETH_DMACRXCR |= ETH_DMACRXCR_SR;
-
-    /* Clear TX and RX process stopped flags. */
-    ETH_DMACSR = ETH_DMACSR_TPS | ETH_DMACSR_RPS;
-
     __asm volatile ("dsb sy" ::: "memory");
-    /* Write tail pointer to start RX DMA. */
-    ETH_DMACRXDTPR = (uint32_t)&rx_ring[RX_DESC_COUNT - 1U];
+    ETH_DMACRXDTPR = (uint32_t)&rx_ring[RX_DESC_COUNT];
 }
 
 static void eth_stop(void)
@@ -610,8 +602,10 @@ int stm32_eth_init(struct wolfIP_ll_dev *ll, const uint8_t *mac)
     }
     eth_config_mac(mac);
     eth_config_mtl();
-    eth_init_desc();
+    /* DMA channel control (RBSZ etc.) must be set BEFORE descriptor pointers
+     * and tail. Writing DMACRDTPR with RBSZ=0 stops RX with RBU latched. */
     eth_config_dma();
+    eth_init_desc();
     eth_phy_init();
     eth_config_speed_duplex();
     eth_start();
