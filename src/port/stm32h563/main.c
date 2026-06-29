@@ -80,6 +80,28 @@ static int tls_client_test_started = 0;
 static int tls_client_test_done = 0;
 #endif
 
+#ifdef ENABLE_WOLFNANO
+#include "wn_client.h"
+#include "wn_io.h"
+#ifndef WN_SERVER_IP
+#define WN_SERVER_IP "192.168.12.1"
+#endif
+#ifndef WN_SERVER_PORT
+#define WN_SERVER_PORT 11111
+#endif
+#if   defined(WN_PROFILE_PSK_P256)
+#define WN_PROFILE_NAME "PSK + ECDHE P-256"
+#elif defined(WN_PROFILE_PQC)
+#define WN_PROFILE_NAME "PSK + X25519MLKEM768 (PQC hybrid)"
+#elif defined(WN_PROFILE_CERT)
+#define WN_PROFILE_NAME "cert / X.509 P-256"
+#elif defined(WN_PROFILE_CERT_MLDSA)
+#define WN_PROFILE_NAME "cert / X.509 + ML-DSA-44"
+#else
+#define WN_PROFILE_NAME "PSK + ECDHE X25519 (minimal)"
+#endif
+#endif
+
 /* Forward declarations */
 void uart_puts(const char *s);
 static void delay(uint32_t count);
@@ -1065,6 +1087,42 @@ int main(void)
     }
 #endif
 #endif /* ENABLE_VLAN */
+
+#ifdef ENABLE_WOLFNANO
+    /* wolfNano TLS 1.3 client demo over wolfIP. Runs the configured profile's
+     * handshake against WN_SERVER_IP:WN_SERVER_PORT, echoes one record, repeats.
+     * Replaces the echo/TLS-server path for this build. */
+    wn_dwt_init();
+    {
+        ip4 srv = atoip4(WN_SERVER_IP);
+        uart_puts("\n=== wolfNano TLS 1.3 client over wolfIP ===\n");
+        uart_puts("  profile: " WN_PROFILE_NAME "\n");
+        uart_puts("  server : ");
+        uart_putip4(srv);
+        uart_puts(":");
+        uart_putdec((uint32_t)WN_SERVER_PORT);
+        uart_puts("\n");
+
+        /* Let the PHY link / ARP settle before the first connect. */
+        {
+            uint32_t i;
+            for (i = 0; i < 300u; i++) { (void)wolfIP_poll(IPStack, tick++); delay(8000); }
+        }
+
+        for (;;) {
+            int wrc = wn_client_run(IPStack, (uint32_t)srv,
+                                    (uint16_t)WN_SERVER_PORT, uart_puts);
+            uart_puts(wrc == 0 ? "wn: demo result OK\n\n"
+                               : "wn: demo result FAIL\n\n");
+            led_toggle();
+            /* heartbeat + pause, then repeat so the demo is observable */
+            {
+                uint32_t i;
+                for (i = 0; i < 2000u; i++) { (void)wolfIP_poll(IPStack, tick++); delay(8000); }
+            }
+        }
+    }
+#endif
 
 #ifdef WOLFIP_USE_FREERTOS
     uart_puts("Starting FreeRTOS BSD socket layer...\n");

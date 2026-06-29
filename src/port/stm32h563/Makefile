@@ -255,6 +255,141 @@ SRCS += $(WOLFSSL_SRCS)
 endif # ENABLE_TLS
 
 # -----------------------------------------------------------------------------
+# wolfNano TLS 1.3 client (ENABLE_WOLFNANO=1)
+#
+# Tiny TLS 1.3 client (wolfNano) over wolfIP, instead of full wolfSSL. Selects a
+# profile via WN_PROFILE and the SP backend via WN_SMALL:
+#   WN_PROFILE = psk_x25519 (default) | psk_p256 | pqc | cert | cert_mldsa
+#   WN_SMALL   = 0 (default, fast Cortex-M asm) | 1 (16-bit Thumb SP, smallest)
+#   WN_SERVER_IP / WN_SERVER_PORT : peer to connect to (default 192.168.12.1:11111)
+# -----------------------------------------------------------------------------
+ENABLE_WOLFNANO ?= 0
+WOLFNANO_ROOT   ?= $(ROOT)/../wolfnano
+WN_PROFILE      ?= psk_x25519
+WN_SMALL        ?= 0
+WN_SERVER_IP    ?= 192.168.12.1
+WN_SERVER_PORT  ?= 11111
+
+ifeq ($(ENABLE_WOLFNANO),1)
+
+ifeq ($(ENABLE_TLS),1)
+  $(error ENABLE_WOLFNANO=1 and ENABLE_TLS=1 are mutually exclusive (two TLS stacks))
+endif
+ifeq ($(wildcard $(WOLFNANO_ROOT)/include/wolfnano/wolfnano.h),)
+  $(error wolfNano not found at $(WOLFNANO_ROOT). Clone it: git clone https://github.com/aidangarske/wolfnano.git (and: git submodule update --init))
+endif
+
+WN_WC  := $(WOLFNANO_ROOT)/wolfssl/wolfcrypt/src
+WN_ARM := $(WN_WC)/port/arm
+WN_S   := $(WOLFNANO_ROOT)/src
+
+# wolfNano include search path. Put the port's wolfNano user_settings.h dir FIRST
+# (ahead of -I. which holds the wolfSSL user_settings.h) so it wins. The wolfSSL
+# tree is searched LAST (WN_INC_WS, appended after base -I.) so the port's own
+# config.h beats any autotools-generated wolfssl/config.h.
+WN_INC    := -Iwolfnano -I$(WOLFNANO_ROOT)/configs -I$(WOLFNANO_ROOT) \
+             -I$(WOLFNANO_ROOT)/include/wolfnano -I$(WOLFNANO_ROOT)/src
+WN_INC_WS := -I$(WOLFNANO_ROOT)/wolfssl
+
+# SP backend + symmetric asm: fast Cortex-M (default) or smallest 16-bit Thumb.
+# cert / cert_mldsa default to portable-C SP (unless WN_SMALL is requested), since
+# the asm SP backends have wolfSSL RSA-verify-only quirks on Cortex-M.
+ifneq ($(filter cert cert_mldsa,$(WN_PROFILE)),)
+  ifneq ($(WN_SMALL),1)
+    WN_PORTABLE := 1
+  endif
+endif
+
+ifeq ($(WN_PORTABLE),1)
+  # Portable-C SP (sp_int.c, no asm). Used by the cert/X.509 profiles: the asm SP
+  # backends have wolfSSL quirks with RSA-verify-only (sp_cortexm) and the Thumb
+  # transform symbols; portable C is how wolfNano itself builds the cert clients.
+  WN_TARGET_DEF := -DWOLFNANO_TARGET_PORTABLE_C
+  WN_SP         := $(WN_WC)/sp_int.c
+  WN_ASM_AES    :=
+  WN_ASM_SHA    :=
+  WN_ASM_C25519 :=
+  WN_ASM_SHA3   :=
+  WN_ASM_MLKEM  :=
+else ifeq ($(WN_SMALL),1)
+  WN_TARGET_DEF := -DWOLFNANO_TARGET_CORTEXM33_SMALL
+  WN_SP         := $(WN_WC)/sp_int.c $(WN_WC)/sp_armthumb.c
+  WN_ASM_AES    :=
+  WN_ASM_SHA    :=
+  WN_ASM_C25519 :=
+  WN_ASM_SHA3   :=
+  WN_ASM_MLKEM  :=
+else
+  WN_TARGET_DEF := -DWOLFNANO_TARGET_CORTEXM33
+  WN_SP         := $(WN_WC)/sp_int.c $(WN_WC)/sp_cortexm.c
+  WN_ASM_AES    := $(WN_ARM)/thumb2-aes-asm_c.c
+  WN_ASM_SHA    := $(WN_ARM)/thumb2-sha256-asm_c.c
+  WN_ASM_C25519 := $(WN_ARM)/thumb2-curve25519_c.c
+  WN_ASM_SHA3   := $(WN_ARM)/thumb2-sha3-asm_c.c
+  WN_ASM_MLKEM  := $(WN_ARM)/thumb2-mlkem-asm_c.c
+endif
+
+# Shared crypto floor + handshake shell (common to all profiles). curve25519 is
+# included everywhere (every shipped config offers the X25519 group); unused code
+# is dropped by --gc-sections, so profiles that only use P-256 pay nothing.
+WN_FLOOR := $(WN_WC)/wc_port.c $(WN_WC)/memory.c $(WN_WC)/error.c $(WN_WC)/hash.c \
+            $(WN_WC)/random.c $(WN_WC)/wolfmath.c $(WN_WC)/logging.c \
+            $(WN_WC)/coding.c $(WN_WC)/sha256.c $(WN_WC)/hmac.c $(WN_WC)/kdf.c \
+            $(WN_WC)/aes.c $(WN_WC)/curve25519.c $(WN_WC)/fe_operations.c
+WN_SHELL := $(WN_S)/wn_error.c $(WN_S)/wn_msg.c $(WN_S)/wn_keyschedule.c \
+            $(WN_S)/wn_transcript.c $(WN_S)/wn_record.c $(WN_S)/wn_keyshare.c \
+            $(WN_S)/wn_serverhello.c $(WN_S)/wn_connect.c $(WN_S)/wn_session.c
+
+# Per-profile crypto + the profile select macro for wn_client.c/user_settings.h.
+ifeq ($(WN_PROFILE),psk_p256)
+  WN_PROFILE_DEF := -DWN_PROFILE_PSK_P256
+  WN_CRYPTO := $(WN_FLOOR) $(WN_WC)/ecc.c $(WN_WC)/asn.c $(WN_SP)
+  WN_ASM    := $(WN_ASM_AES) $(WN_ASM_SHA) $(WN_ASM_C25519)
+else ifeq ($(WN_PROFILE),pqc)
+  WN_PROFILE_DEF := -DWN_PROFILE_PQC
+  WN_CRYPTO := $(WN_FLOOR) $(WN_WC)/sha3.c $(WN_WC)/wc_mlkem.c \
+               $(WN_WC)/wc_mlkem_poly.c $(WN_SP)
+  WN_SHELL  += $(WN_S)/wn_hybrid.c
+  WN_ASM    := $(WN_ASM_AES) $(WN_ASM_SHA) $(WN_ASM_C25519) \
+               $(WN_ASM_SHA3) $(WN_ASM_MLKEM)
+else ifeq ($(WN_PROFILE),cert)
+  # NO_X509_TIME: the board has no RTC, so skip cert validity-date checks.
+  WN_PROFILE_DEF := -DWN_PROFILE_CERT -DWOLFNANO_ALLOW_MALLOC -DWOLFNANO_NO_X509_TIME
+  WN_CRYPTO := $(WN_FLOOR) $(WN_WC)/sha512.c $(WN_WC)/ecc.c $(WN_WC)/asn.c \
+               $(WN_WC)/rsa.c $(WN_SP)
+  WN_SHELL  += $(WN_S)/wn_clienthello.c
+  WN_ASM    := $(WN_ASM_AES) $(WN_ASM_SHA) $(WN_ASM_C25519)
+else ifeq ($(WN_PROFILE),cert_mldsa)
+  WN_PROFILE_DEF := -DWN_PROFILE_CERT_MLDSA -DWOLFNANO_ALLOW_MALLOC -DWOLFNANO_NO_X509_TIME
+  WN_CRYPTO := $(WN_FLOOR) $(WN_WC)/sha512.c $(WN_WC)/ecc.c $(WN_WC)/asn.c \
+               $(WN_WC)/sha3.c $(WN_WC)/wc_mldsa.c $(WN_SP)
+  WN_SHELL  += $(WN_S)/wn_clienthello.c
+  WN_ASM    := $(WN_ASM_AES) $(WN_ASM_SHA) $(WN_ASM_C25519) $(WN_ASM_SHA3)
+else  # psk_x25519 (default, smallest)
+  WN_PROFILE_DEF := -DWN_PROFILE_PSK_X25519
+  WN_CRYPTO := $(WN_FLOOR) $(WN_SP)
+  WN_ASM    := $(WN_ASM_AES) $(WN_ASM_SHA) $(WN_ASM_C25519)
+endif
+
+# Prepend WN_INC so wolfnano/user_settings.h shadows the wolfSSL one on -I.;
+# append WN_INC_WS so the wolfSSL tree is searched after the port dir (config.h).
+# Drop -Werror: main.c now pulls in external wolfNano/wolfSSL headers.
+CFLAGS := $(WN_INC) $(filter-out -Werror,$(CFLAGS)) $(WN_INC_WS)
+CFLAGS += -DENABLE_WOLFNANO -DWOLFSSL_USER_SETTINGS $(WN_TARGET_DEF) $(WN_PROFILE_DEF)
+CFLAGS += -DWN_SERVER_IP=\"$(WN_SERVER_IP)\" -DWN_SERVER_PORT=$(WN_SERVER_PORT)
+
+# Relaxed warnings for wolfNano/wolfSSL sources (they trip -Werror otherwise).
+CFLAGS_WN := $(filter-out -Werror,$(CFLAGS))
+CFLAGS_WN += -Wno-unused-variable -Wno-unused-function -Wno-unused-parameter \
+             -Wno-sign-compare -Wno-unused-but-set-variable
+
+# App glue + wolfNano library sources.
+SRCS += wn_client.c $(ROOT)/src/port/wn_io.c
+SRCS += $(WN_CRYPTO) $(WN_SHELL) $(WN_ASM)
+
+endif # ENABLE_WOLFNANO
+
+# -----------------------------------------------------------------------------
 # SSH Support (wolfSSH)
 # -----------------------------------------------------------------------------
 ifeq ($(ENABLE_SSH),1)
@@ -509,6 +644,13 @@ factory: factory.bin
 $(WOLFSSL_ROOT)/%.o: $(WOLFSSL_ROOT)/%.c
 	$(CC) $(CFLAGS_WOLFSSL) -DWOLFSSL_USER_SETTINGS $(if $(filter 1,$(ENABLE_SSH)),-DENABLE_SSH -DWOLFSSL_WOLFSSH) $(if $(filter 1,$(ENABLE_MQTT_BROKER)),-DENABLE_MQTT_BROKER) -I$(WOLFSSL_ROOT) -c $< -o $@
 
+# wolfNano (and its wolfSSL submodule) objects use relaxed warnings + the
+# wolfNano user_settings/includes already baked into CFLAGS_WN.
+ifeq ($(ENABLE_WOLFNANO),1)
+$(WOLFNANO_ROOT)/%.o: $(WOLFNANO_ROOT)/%.c
+	$(CC) $(CFLAGS_WN) -c $< -o $@
+endif
+
 clean:
 	rm -f *.o app.elf app.bin
 	rm -f app_v1_signed.bin factory.bin wolfboot_padded.bin
@@ -525,6 +667,11 @@ ifeq ($(ENABLE_TLS),1)
 	rm -f $(WOLFSSL_ROOT)/wolfcrypt/src/*.o
 	rm -f $(WOLFSSL_ROOT)/src/*.o
 endif
+# Always clean wolfNano objects (unconditional) so a profile/SP switch never
+# links stale objects compiled for a different config.
+	rm -f $(WOLFNANO_ROOT)/wolfssl/wolfcrypt/src/*.o
+	rm -f $(WOLFNANO_ROOT)/wolfssl/wolfcrypt/src/port/arm/*.o
+	rm -f $(WOLFNANO_ROOT)/src/*.o
 ifeq ($(ENABLE_SSH),1)
 	rm -f $(WOLFSSH_ROOT)/src/*.o
 endif

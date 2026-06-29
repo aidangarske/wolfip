@@ -497,6 +497,144 @@ openssl req -new -x509 -key server_key.pem -out server_cert.pem \
 # Copy PEM content into certs.h as string literals
 ```
 
+## wolfNano (Tiny TLS 1.3 Client)
+
+A minimal TLS 1.3 *client* (wolfNano) over wolfIP, as an alternative to the full
+wolfSSL stack above. It handshakes against a wolfSSL example server and does one
+encrypted echo. **Requires TrustZone disabled** (see "Disabling TrustZone").
+
+### Prerequisites
+
+Clone wolfNano alongside wolfip and init its wolfSSL submodule:
+
+```bash
+cd /path/to/parent
+git clone https://github.com/aidangarske/wolfNanoTLS.git wolfnano
+git -C wolfnano submodule update --init
+```
+
+Build the wolfSSL example server (the peer) with PSK + TLS 1.3 (add `--enable-mlkem`
+for the PQC profile):
+
+```bash
+cd /path/to/parent/wolfnano/wolfssl
+./autogen.sh
+./configure --enable-psk --enable-tls13 --enable-curve25519 --enable-aesgcm \
+            --enable-mlkem --enable-experimental --disable-shared \
+            CFLAGS="-DWOLFSSL_STATIC_PSK"
+make
+```
+
+The wolfSSL server's TLS 1.3 `-s` PSK (identity `Client_identity`) matches the
+firmware's built-in key automatically — no extra config.
+
+### Network
+
+Set a static IP on the server's subnet in `wn_netcfg.h` (the board must share a
+switch with the server host):
+
+```c
+#define WOLFIP_ENABLE_DHCP 0
+#define WOLFIP_IP      "10.0.4.222"   /* free IP on the server's subnet */
+#define WOLFIP_NETMASK "255.255.255.0"
+#define WOLFIP_GW      "10.0.4.1"
+```
+
+### Building
+
+```bash
+make clean
+make ENABLE_WOLFNANO=1 WN_PROFILE=psk_x25519 \
+     WN_SERVER_IP=10.0.4.16 WN_SERVER_PORT=11111 \
+     EXTRA_CFLAGS='-include wn_netcfg.h'
+```
+
+`WN_SERVER_IP` is the host running the wolfSSL server. Profiles:
+
+| `WN_PROFILE`  | Handshake                     | Server build      |
+|---------------|-------------------------------|-------------------|
+| `psk_x25519`  | PSK + ECDHE X25519 (smallest) | base              |
+| `psk_p256`    | PSK + ECDHE P-256             | base              |
+| `pqc`         | PSK + X25519MLKEM768 (PQC)    | `--enable-mlkem`  |
+| `cert`        | X.509 server cert             | server cert       |
+| `cert_mldsa`  | X.509 + ML-DSA-44 (PQC sig)   | ML-DSA cert       |
+
+Add `WN_SMALL=1` for the smallest 16-bit-Thumb SP math (vs the default fast
+Cortex-M asm).
+
+### Running
+
+```bash
+# 1) Start the wolfSSL server on the host (leave running):
+cd /path/to/parent/wolfnano/wolfssl
+./examples/server/server -v 4 -s -i -b -p 11111
+
+# 2) Flash and watch UART (see "Flashing" / "Serial Console"):
+openocd -f interface/stlink-dap.cfg -f target/stm32h5x.cfg \
+    -c "program app.elf verify reset exit"
+stty -F /dev/ttyACM0 115200 raw -echo && cat /dev/ttyACM0
+```
+
+### Expected Output
+
+```
+=== wolfNano TLS 1.3 client over wolfIP ===
+  profile: PSK + ECDHE X25519 (minimal)
+  server : 10.0.4.16:11111
+  wn: TCP connected
+  wn: handshake OK, cycles=3228564 (~50 ms)
+  wn: echo: I hear you fa shizzle!
+  wn: PASS
+```
+
+The server prints `Ciphersuite: TLS_AES_128_GCM_SHA256` (or the profile's group)
+and replies `I hear you fa shizzle!`. `cycles` is the DWT count around
+`wn_Connect_*`; `~ms` assumes the reset-default 64 MHz HSI core clock (override
+`-DWN_CORE_HZ=<hz>` if you configure a PLL).
+
+### Measured handshake times (NUCLEO-H563ZI @ ~64 MHz, vs wolfSSL `server -v 4 -s/-c -i -b`)
+
+| Profile      | Handshake / auth              | SP backend     | DWT cycles   | ≈ time  |
+|--------------|-------------------------------|----------------|--------------|---------|
+| `psk_x25519` | PSK + ECDHE X25519            | Cortex-M asm   | 3,228,564    | ~50 ms  |
+| `psk_p256`   | PSK + ECDHE P-256             | Cortex-M asm   | 5,517,711    | ~86 ms  |
+| `pqc`        | PSK + X25519MLKEM768 (hybrid) | Cortex-M asm   | 6,227,080    | ~97 ms  |
+| `cert`       | X.509 P-256 (ECDSA verify)    | portable C¹    | 268,694,494  | ~4.2 s  |
+| `cert_mldsa` | X.509 + ML-DSA-44 verify      | portable C¹    | 121,944,342  | ~1.9 s  |
+
+¹ The cert profiles default to portable-C SP math (`sp_int.c`), since the fast
+`sp_cortexm` asm has a wolfSSL RSA-verify-only build quirk — hence the much
+larger times. Speeding up the cert path (ECDSA-only fast SP) is a future
+optimization; the handshakes themselves verify correctly and exchange app data.
+
+All five complete against the wolfSSL example server and return its
+`I hear you fa shizzle!` reply over the encrypted channel.
+
+### Footprint (approximate)
+
+Rough linked `.text` of the wolfNano TLS 1.3 client per profile (Cortex-M33,
+`-Os -flto --gc-sections`, nano.specs) — see the canonical
+[wolfNano wiki](https://github.com/aidangarske/wolfNano/wiki/Footprint):
+
+| Profile | wolfNano `.text` |
+|---|--:|
+| PSK X25519 (minimal) | ~17.6 KB |
+| PSK P-256 | ~25.2 KB |
+| PQC X25519MLKEM768 | ~32.9 KB |
+| cert X.509 P-256 | ~60.8 KB |
+| cert + ML-DSA-44 | ~79.3 KB |
+
+For comparison, a full **wolfSSL** TLS 1.3 client at the same scope is ~150 KB
+`.text`, so wolfNano is roughly **2–2.5× smaller** on the H5. (Exact bytes vary
+with the arm-none-eabi-gcc version; the wiki holds the reference numbers.)
+
+### CI
+
+`.github/workflows/stm32h563-m33mu-wolfnano.yml` runs all five profiles in the
+**m33mu** Cortex-M33 emulator against a wolfSSL server on the tap host
+(`192.168.12.1`), asserting `wn: PASS` for each — i.e. TLS 1.3 over wolfIP,
+client-on-emulated-board vs wolfSSL, exercised on every push/PR.
+
 ## HTTPS Web Server
 
 When built with `ENABLE_HTTPS=1`, the device serves a status web page on port 443.

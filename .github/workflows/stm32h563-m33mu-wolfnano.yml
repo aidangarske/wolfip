@@ -1,0 +1,143 @@
+name: STM32H563 m33mu wolfNano (TLS 1.3 over wolfIP)
+
+# Runs the wolfNano tiny-TLS-1.3 client (over wolfIP) in the m33mu Cortex-M33
+# emulator and handshakes against a wolfSSL example server on the tap host, for
+# every profile: PSK X25519 / PSK P-256 / PQC hybrid / X.509 / X.509+ML-DSA-44.
+#
+# Topology (same tap setup as the echo job): host tap0 = 192.168.12.1/24 with
+# dnsmasq DHCP; the emulated board DHCPs onto 192.168.12.x and connects to the
+# wolfSSL server at 192.168.12.1:11111. Pass = the board prints "wn: PASS".
+
+on:
+  push:
+    branches: [ 'master', 'main', 'release/**' ]
+  pull_request:
+    branches: [ '*' ]
+
+jobs:
+  wolfnano_tls:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    container:
+      image: ghcr.io/danielinux/m33mu-ci:1.8
+      options: --privileged
+    strategy:
+      fail-fast: false
+      matrix:
+        profile: [ psk_x25519, psk_p256, pqc, cert, cert_mldsa ]
+
+    steps:
+      - name: Checkout wolfIP
+        uses: actions/checkout@v4
+        with:
+          path: wolfip
+
+      - name: Checkout wolfNano (+ wolfSSL submodule)
+        uses: actions/checkout@v4
+        with:
+          repository: aidangarske/wolfNanoTLS
+          submodules: recursive
+          path: wolfnano
+
+      - name: Install host tools
+        run: |
+          set -euo pipefail
+          apt-get update
+          apt-get install -y sudo dnsmasq iproute2 netcat-openbsd \
+                             autoconf automake libtool
+
+      - name: Build wolfSSL example server (PSK + ML-KEM + ML-DSA)
+        run: |
+          set -euo pipefail
+          cd wolfnano/wolfssl
+          ./autogen.sh
+          ./configure --enable-psk --enable-tls13 --enable-curve25519 \
+                      --enable-aesgcm --enable-mlkem --enable-dilithium \
+                      --enable-experimental --disable-shared \
+                      CFLAGS="-DWOLFSSL_STATIC_PSK"
+          make -j"$(nproc)"
+
+      - name: Build wolfNano firmware (${{ matrix.profile }})
+        run: |
+          set -euo pipefail
+          make -C wolfip/src/port/stm32h563 clean
+          make -C wolfip/src/port/stm32h563 \
+            CC=arm-none-eabi-gcc OBJCOPY=arm-none-eabi-objcopy \
+            ENABLE_WOLFNANO=1 WN_PROFILE=${{ matrix.profile }} \
+            WN_SERVER_IP=192.168.12.1 WN_SERVER_PORT=11111
+          arm-none-eabi-size wolfip/src/port/stm32h563/app.elf
+
+      - name: Run m33mu + wolfSSL server + assert handshake
+        timeout-minutes: 12
+        run: |
+          set -euo pipefail
+          WN="$(pwd)/wolfnano"
+          PROFILE="${{ matrix.profile }}"
+
+          cleanup() {
+            set +e
+            [ -f /tmp/m33mu.pid ] && sudo kill "$(cat /tmp/m33mu.pid)" 2>/dev/null
+            sudo pkill -x m33mu 2>/dev/null
+            sudo pkill -f 'examples/server/server' 2>/dev/null
+            [ -f /tmp/dnsmasq.pid ] && sudo kill "$(cat /tmp/dnsmasq.pid)" 2>/dev/null
+            sudo ip link del tap0 2>/dev/null
+          }
+          trap cleanup EXIT
+
+          # --- tap0 + DHCP (host = 192.168.12.1, the wolfSSL server address) ---
+          sudo ip tuntap add dev tap0 mode tap
+          sudo ip addr add 192.168.12.1/24 dev tap0
+          sudo ip link set tap0 up
+          cat > /tmp/dnsmasq.conf <<'EOF'
+          interface=tap0
+          bind-interfaces
+          dhcp-range=192.168.12.50,192.168.12.100,255.255.255.0,12h
+          dhcp-leasefile=/tmp/dnsmasq.leases
+          log-dhcp
+          EOF
+          sudo dnsmasq --conf-file=/tmp/dnsmasq.conf --pid-file=/tmp/dnsmasq.pid
+
+          # --- wolfSSL server: PSK for psk/pqc, server cert for cert profiles ---
+          case "$PROFILE" in
+            cert)
+              SRV="-c $WN/tests/pki/server/ecdsa-cert.pem -k $WN/tests/pki/server/ecdsa-key.pem -d" ;;
+            cert_mldsa)
+              SRV="-c $WN/wolfssl/certs/mldsa/mldsa44-cert.pem -k $WN/wolfssl/certs/mldsa/mldsa44-key.pem -d" ;;
+            *)
+              SRV="-s" ;;   # external PSK (X25519 / P-256 / X25519MLKEM768)
+          esac
+          ( cd "$WN/wolfssl" && \
+            while true; do ./examples/server/server -v 4 $SRV -i -b -p 11111; sleep 1; done ) \
+            >/tmp/wolfssl_srv.log 2>&1 &
+          for _ in $(seq 1 30); do
+            if ss -ltn 2>/dev/null | grep -q ':11111 '; then break; fi
+            sleep 0.5
+          done
+
+          # --- run the emulated board (board DHCPs, connects, handshakes, loops) ---
+          sudo m33mu wolfip/src/port/stm32h563/app.bin \
+            --cpu stm32h563 --tap:tap0 --uart-stdout --timeout 300 \
+            2>&1 | tee /tmp/m33mu.log &
+          sleep 1
+          m33mu_pid="$(pgrep -n -x m33mu || true)"
+          [ -n "$m33mu_pid" ] && echo "$m33mu_pid" > /tmp/m33mu.pid
+
+          # --- assert: the board prints "wn: PASS" (cert profiles are slow) ---
+          ok=0
+          for _ in $(seq 1 300); do
+            if grep -q "wn: PASS" /tmp/m33mu.log; then ok=1; break; fi
+            if grep -q "wn: handshake FAILED" /tmp/m33mu.log; then break; fi
+            if ! pgrep -x m33mu >/dev/null 2>&1; then break; fi
+            sleep 1
+          done
+
+          echo "================ m33mu UART (tail) ================"
+          tail -n 60 /tmp/m33mu.log || true
+          echo "================ wolfSSL server (tail) ============"
+          tail -n 20 /tmp/wolfssl_srv.log || true
+
+          if [ "$ok" -ne 1 ]; then
+            echo "wolfNano $PROFILE handshake did NOT pass."
+            exit 1
+          fi
+          echo "wolfNano $PROFILE: TLS 1.3 over wolfIP handshake PASSED."

@@ -88,11 +88,20 @@
 #endif
 #endif
 
-/* Static IP fallback (used when DHCP is disabled or times out) */
+/* Static IP fallback (used when DHCP is disabled or times out).
+ * Overridable via -D or a forced -include header (e.g. for the wolfNano demo). */
+#ifndef WOLFIP_IP
 #define WOLFIP_IP                "192.168.12.11"
+#endif
+#ifndef WOLFIP_NETMASK
 #define WOLFIP_NETMASK           "255.255.255.0"
+#endif
+#ifndef WOLFIP_GW
 #define WOLFIP_GW                "192.168.12.1"
+#endif
+#ifndef WOLFIP_STATIC_DNS_IP
 #define WOLFIP_STATIC_DNS_IP     "9.9.9.9"
+#endif
 
 #if WOLFIP_ENABLE_DHCP
 #define DHCP
